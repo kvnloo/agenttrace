@@ -1,5 +1,6 @@
 use crate::{parse_jsonl_session, session_from_events, Event, Session, ToolCall};
 use anyhow::{bail, Context};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -79,8 +80,14 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_hermes_json_value(value) {
             return session_from_events(name, path, events);
         }
+        if let Some(events) = parse_hermes_trajectory_value(value) {
+            return session_from_events(name, path, events);
+        }
     }
     if parsed_value.is_none() {
+        if let Some(events) = parse_hermes_trajectory_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
         if let Some(events) = parse_codex_rollout_jsonl(raw) {
             return session_from_events(name, path, events);
         }
@@ -768,6 +775,433 @@ fn apply_hermes_session_timestamps(events: &mut [Event], session_start: &str, se
     }
 }
 
+fn parse_hermes_trajectory_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let mut events = Vec::new();
+    let mut found = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            if found {
+                continue;
+            }
+            return None;
+        };
+        let Some(doc) = value.as_object() else {
+            if found {
+                continue;
+            }
+            return None;
+        };
+        if !is_hermes_trajectory_object(doc) {
+            if found {
+                continue;
+            }
+            return None;
+        }
+        found = true;
+        events.extend(hermes_trajectory_events(doc));
+    }
+    non_empty(events)
+}
+
+fn parse_hermes_trajectory_value(value: &Value) -> Option<Vec<Event>> {
+    let doc = value.as_object()?;
+    if !is_hermes_trajectory_object(doc) {
+        return None;
+    }
+    non_empty(hermes_trajectory_events(doc))
+}
+
+fn is_hermes_trajectory_object(doc: &Map<String, Value>) -> bool {
+    if doc.contains_key("messages") && doc.contains_key("session_id") {
+        return false;
+    }
+    let Some(conversations) = doc.get("conversations").and_then(Value::as_array) else {
+        return false;
+    };
+    if conversations.is_empty() {
+        return false;
+    }
+    conversations.iter().any(|item| {
+        item.as_object().is_some_and(|obj| {
+            string(obj.get("from")).is_some() && obj.contains_key("value")
+        })
+    })
+}
+
+fn hermes_trajectory_duration_sec(doc: &Map<String, Value>) -> Option<f64> {
+    const KEYS: &[&str] = &[
+        "duration_seconds",
+        "duration_sec",
+        "latency_seconds",
+        "latency_sec",
+        "duration",
+        "latency",
+    ];
+    for key in KEYS {
+        if let Some(value) = doc.get(*key).and_then(number_as_f64) {
+            if value > 0.0 {
+                return Some(value);
+            }
+        }
+    }
+    if let Some(ms) = doc
+        .get("latency_ms")
+        .or_else(|| doc.get("duration_ms"))
+        .and_then(number_as_f64)
+    {
+        if ms > 0.0 {
+            return Some(ms / 1000.0);
+        }
+    }
+    if let Some(meta) = doc.get("metadata").and_then(Value::as_object) {
+        for key in KEYS {
+            if let Some(value) = meta.get(*key).and_then(number_as_f64) {
+                if value > 0.0 {
+                    return Some(value);
+                }
+            }
+        }
+        if let Some(ms) = meta
+            .get("latency_ms")
+            .or_else(|| meta.get("duration_ms"))
+            .and_then(number_as_f64)
+        {
+            if ms > 0.0 {
+                return Some(ms / 1000.0);
+            }
+        }
+    }
+    None
+}
+
+fn number_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn hermes_trajectory_events(doc: &Map<String, Value>) -> Vec<Event> {
+    let model = string(doc.get("model")).unwrap_or("unknown").to_string();
+    let timestamp = string(doc.get("timestamp")).unwrap_or("").to_string();
+    let duration_sec = hermes_trajectory_duration_sec(doc);
+    let (start_ts, end_ts) = hermes_trajectory_time_bounds(&timestamp, duration_sec);
+
+    let mut events = Vec::new();
+    let usage = doc
+        .get("usage")
+        .and_then(usage_from_value)
+        .or_else(|| {
+            doc.get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("usage"))
+                .and_then(usage_from_value)
+        });
+    if let Some(usage) = usage {
+        events.push(Event {
+            role: "meta".to_string(),
+            usage,
+            model_used: model.clone(),
+            source_tool: "hermes_trajectory".to_string(),
+            timestamp: start_ts.clone(),
+            ..Event::default()
+        });
+    } else if model != "unknown" {
+        events.push(Event {
+            role: "meta".to_string(),
+            model_used: model.clone(),
+            source_tool: "hermes_trajectory".to_string(),
+            timestamp: start_ts.clone(),
+            ..Event::default()
+        });
+    }
+
+    let conversations = doc
+        .get("conversations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let turn_count = conversations.len().max(1);
+    for (idx, turn) in conversations.iter().enumerate() {
+        let Some(turn) = turn.as_object() else {
+            continue;
+        };
+        let from = string(turn.get("from")).unwrap_or("");
+        let value = string(turn.get("value")).unwrap_or("");
+        let turn_ts = hermes_trajectory_turn_timestamp(&start_ts, &end_ts, idx, turn_count);
+        match from {
+            "system" => {
+                if value.is_empty() {
+                    continue;
+                }
+                events.push(Event {
+                    role: "system".to_string(),
+                    content: value.to_string(),
+                    timestamp: turn_ts,
+                    model_used: model.clone(),
+                    source_tool: "hermes_trajectory".to_string(),
+                    ..Event::default()
+                });
+            }
+            "human" => {
+                events.push(Event {
+                    role: "user".to_string(),
+                    content: value.to_string(),
+                    timestamp: turn_ts,
+                    model_used: model.clone(),
+                    source_tool: "hermes_trajectory".to_string(),
+                    ..Event::default()
+                });
+            }
+            "gpt" => {
+                let (content, reasoning, mut tool_calls) = hermes_trajectory_gpt_parts(value);
+                if tool_calls.is_empty() {
+                    if let Some(calls) = turn.get("tool_calls").and_then(Value::as_array) {
+                        for call in calls {
+                            if let Some(parsed) = hermes_trajectory_tool_call_from_value(call) {
+                                tool_calls.push(parsed);
+                            }
+                        }
+                    }
+                }
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    content,
+                    reasoning,
+                    tool_calls,
+                    timestamp: turn_ts,
+                    model_used: model.clone(),
+                    source_tool: "hermes_trajectory".to_string(),
+                    ..Event::default()
+                });
+            }
+            "tool" => {
+                let tool_events = hermes_trajectory_tool_events(value, &turn_ts, &model);
+                if tool_events.is_empty() {
+                    events.push(Event {
+                        role: "tool".to_string(),
+                        content: value.to_string(),
+                        timestamp: turn_ts,
+                        model_used: model.clone(),
+                        source_tool: "hermes_trajectory".to_string(),
+                        ..Event::default()
+                    });
+                } else {
+                    events.extend(tool_events);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if events
+        .iter()
+        .filter(|event| !matches!(event.role.as_str(), "meta" | "session_meta" | "system"))
+        .count()
+        == 0
+    {
+        return Vec::new();
+    }
+    events
+}
+
+fn hermes_trajectory_time_bounds(timestamp: &str, duration_sec: Option<f64>) -> (String, String) {
+    if timestamp.is_empty() {
+        return (String::new(), String::new());
+    }
+    let Some(end) = parse_hermes_ts(timestamp) else {
+        return (timestamp.to_string(), timestamp.to_string());
+    };
+    let start = if let Some(duration) = duration_sec.filter(|value| *value > 0.0) {
+        end - ChronoDuration::milliseconds((duration * 1000.0).round() as i64)
+    } else {
+        end
+    };
+    (
+        start.to_rfc3339_opts(SecondsFormat::Millis, true),
+        end.to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+}
+
+fn parse_hermes_ts(value: &str) -> Option<DateTime<Utc>> {
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('Z', "+00:00");
+    if let Ok(ts) = DateTime::parse_from_rfc3339(&normalized) {
+        return Some(ts.with_timezone(&Utc));
+    }
+    NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))
+        .ok()
+        .map(|ts| ts.and_utc())
+}
+
+fn hermes_trajectory_turn_timestamp(
+    start_ts: &str,
+    end_ts: &str,
+    idx: usize,
+    turn_count: usize,
+) -> String {
+    if start_ts.is_empty() {
+        return String::new();
+    }
+    if turn_count <= 1 || start_ts == end_ts || end_ts.is_empty() {
+        return start_ts.to_string();
+    }
+    let Some(start) = parse_hermes_ts(start_ts) else {
+        return start_ts.to_string();
+    };
+    let Some(end) = parse_hermes_ts(end_ts) else {
+        return start_ts.to_string();
+    };
+    if idx + 1 >= turn_count {
+        return end_ts.to_string();
+    }
+    if idx == 0 {
+        return start_ts.to_string();
+    }
+    let total_ms = (end - start).num_milliseconds().max(0) as f64;
+    let offset = (total_ms * (idx as f64) / ((turn_count - 1) as f64)).round() as i64;
+    (start + ChronoDuration::milliseconds(offset))
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn hermes_trajectory_gpt_parts(value: &str) -> (String, String, Vec<ToolCall>) {
+    let mut reasoning_parts = Vec::new();
+    for tag in ["think", "REASONING_SCRATCHPAD"] {
+        for block in extract_xml_blocks(value, tag) {
+            let trimmed = block.trim();
+            if !trimmed.is_empty() {
+                reasoning_parts.push(trimmed.to_string());
+            }
+        }
+    }
+    let mut tool_calls = Vec::new();
+    for block in extract_xml_blocks(value, "tool_call") {
+        if let Ok(parsed) = serde_json::from_str::<Value>(block.trim()) {
+            if let Some(call) = hermes_trajectory_tool_call_from_value(&parsed) {
+                tool_calls.push(call);
+            }
+        }
+    }
+    let mut content = value.to_string();
+    for tag in ["think", "REASONING_SCRATCHPAD", "tool_call"] {
+        content = strip_xml_blocks(&content, tag);
+    }
+    let content = content.trim().to_string();
+    (content, reasoning_parts.join("\n"), tool_calls)
+}
+
+fn hermes_trajectory_tool_call_from_value(value: &Value) -> Option<ToolCall> {
+    let obj = value.as_object()?;
+    let function = obj.get("function").and_then(Value::as_object);
+    let name = string(obj.get("name"))
+        .or_else(|| function.and_then(|function| string(function.get("name"))))
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = jsonish(
+        obj.get("arguments")
+            .or_else(|| obj.get("args"))
+            .or_else(|| obj.get("input"))
+            .or_else(|| function.and_then(|function| function.get("arguments"))),
+    );
+    Some(ToolCall {
+        id: string(obj.get("id"))
+            .or_else(|| string(obj.get("tool_call_id")))
+            .unwrap_or("")
+            .to_string(),
+        name,
+        args,
+    })
+}
+
+fn hermes_trajectory_tool_events(value: &str, timestamp: &str, model: &str) -> Vec<Event> {
+    let blocks = extract_xml_blocks(value, "tool_response");
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for block in blocks {
+        let (content, tool_call_id, is_error) = match serde_json::from_str::<Value>(block.trim()) {
+            Ok(Value::Object(obj)) => {
+                let content = match obj.get("content") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                    None => block.trim().to_string(),
+                };
+                let tool_call_id = string(obj.get("tool_call_id"))
+                    .or_else(|| string(obj.get("id")))
+                    .unwrap_or("")
+                    .to_string();
+                let is_error = boolish(obj.get("is_error"))
+                    || obj.get("success") == Some(&Value::Bool(false))
+                    || obj
+                        .get("error")
+                        .is_some_and(|error| !matches!(error, Value::Null));
+                (content, tool_call_id, is_error)
+            }
+            _ => (block.trim().to_string(), String::new(), false),
+        };
+        events.push(Event {
+            role: "tool".to_string(),
+            content,
+            timestamp: timestamp.to_string(),
+            tool_call_id,
+            is_error,
+            model_used: model.to_string(),
+            source_tool: "hermes_trajectory".to_string(),
+            ..Event::default()
+        });
+    }
+    events
+}
+
+fn extract_xml_blocks<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else {
+            break;
+        };
+        out.push(&after[..end]);
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
+fn strip_xml_blocks(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        match after.find(&close) {
+            Some(end) => rest = &after[end + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+
 fn parse_anthropic_message_wrapper(
     doc: &Map<String, Value>,
     source_tool: &str,
@@ -1022,7 +1456,7 @@ fn aider_time(value: &str) -> String {
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .ok()
         .and_then(|ts| ts.and_local_timezone(chrono::Local).single())
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Secs, false))
         .unwrap_or_default()
 }
 
@@ -3137,7 +3571,7 @@ fn opencode_record_time(doc: &Map<String, Value>) -> Option<chrono::DateTime<chr
 
 fn opencode_time_from_map(raw: Option<&Value>, keys: &[&str]) -> String {
     opencode_time_value(raw, keys)
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::AutoSi, true))
         .unwrap_or_default()
 }
 
@@ -3493,7 +3927,7 @@ fn cline_unix_timestamp(value: i64) -> String {
         timestamp_millis(value)
     } else if value > 1_000_000_000 {
         chrono::DateTime::<chrono::Utc>::from_timestamp(value, 0)
-            .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Secs, true))
             .unwrap_or_default()
     } else {
         String::new()
@@ -3504,7 +3938,7 @@ fn timestamp_millis(ms: i64) -> String {
     let secs = ms / 1000;
     let nsec = ((ms % 1000) * 1_000_000) as u32;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Millis, true))
         .unwrap_or_default()
 }
 
@@ -3512,7 +3946,7 @@ fn timestamp_millis_nanos(ms: i64) -> String {
     let secs = ms / 1000;
     let nsec = ((ms % 1000) * 1_000_000) as u32;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Nanos, true))
         .unwrap_or_default()
 }
 
@@ -3950,7 +4384,7 @@ fn copilot_timestamp(raw: Option<&Value>) -> String {
     let secs = value / 1_000_000_000;
     let nsec = (value % 1_000_000_000) as u32;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Nanos, true))
         .unwrap_or_default()
 }
 
