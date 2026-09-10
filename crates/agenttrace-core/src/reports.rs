@@ -1836,6 +1836,7 @@ fn tool_display_name(name: &str) -> String {
         "hermes_jsonl" => "Hermes Agent (JSONL)".to_string(),
         "hermes_json" => "Hermes Agent (.json)".to_string(),
         "hermes_db" => "Hermes Agent (DB)".to_string(),
+        "hermes_trajectory" => "Hermes Agent (Trajectory)".to_string(),
         "claude_code" => "Claude Code".to_string(),
         "claude_code_jsonl" => "Claude Code (JSONL)".to_string(),
         "codex_cli" => "Codex CLI".to_string(),

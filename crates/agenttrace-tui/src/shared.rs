@@ -241,6 +241,7 @@ pub(super) fn display_source_label(source: &str) -> String {
         "claude_code" => "Claude Code".to_string(),
         "codex_cli" => "Codex".to_string(),
         "hermes_db" => "Hermes DB".to_string(),
+        "hermes_trajectory" => "Hermes Trajectory".to_string(),
         "opencode_db" => "OpenCode DB".to_string(),
         _ if source.contains('/') => source
             .rsplit('/')

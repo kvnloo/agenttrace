@@ -1,6 +1,6 @@
 use agenttrace_core::{
     build_doctor_report, find_session_files, load_sessions_from_dir, load_sessions_with_progress,
-    parse_file, render_waste_report, search_sessions, session_cache_path, session_capability,
+    parse_file, render_waste_report, round4, search_sessions, session_cache_path, session_capability,
     LoadOptions,
 };
 use rusqlite::Connection;
@@ -1617,4 +1617,86 @@ fn write_opencode_db(path: &std::path::Path) {
         "#,
     )
     .expect("seed opencode db");
+}
+
+
+#[test]
+fn rust_parses_hermes_trajectory_jsonl_cost_token_latency() {
+    let session_path = generated_fixture("hermes-trajectory.jsonl");
+    let parsed = parse_file(&session_path).expect("parse synthetic hermes trajectory jsonl");
+    let metrics = &parsed.metrics;
+    assert_eq!(metrics.source_tool, "hermes_trajectory");
+    assert_eq!(metrics.model_used, "claude-sonnet-4");
+    assert!(metrics.user_messages >= 2, "expected human turns from both trajectory lines");
+    assert!(metrics.assistant_turns >= 3, "expected gpt turns");
+    assert!(
+        metrics.tool_calls_total >= 2,
+        "expected parsed <tool_call> entries, got {}",
+        metrics.tool_calls_total
+    );
+    assert!(metrics.tool_usage.get("terminal").copied().unwrap_or(0) >= 2);
+    assert_eq!(metrics.tokens_input, 1500, "1200 + 300 from usage / metadata.usage");
+    assert_eq!(metrics.tokens_output, 220, "180 + 40 from usage / metadata.usage");
+    assert_eq!(metrics.tokens_cache_r, 40);
+    assert_eq!(metrics.provenance.tokens, "reported_by_agent");
+    assert!(
+        metrics.duration_sec > 0.0,
+        "duration/latency fields should synthesize timestamps, got {}",
+        metrics.duration_sec
+    );
+    assert!(
+        metrics.cost_estimated > 0.0,
+        "token usage should price into cost_estimated, got {}",
+        metrics.cost_estimated
+    );
+    // claude-sonnet-4 builtin: input $3 / output $15 / cache-read $0.30 per 1M tokens
+    let expected = round4(1500.0 / 1e6 * 3.0 + 220.0 / 1e6 * 15.0 + 40.0 / 1e6 * 0.30);
+    assert!(
+        (metrics.cost_estimated - expected).abs() < 1e-9,
+        "cost_estimated {} != expected {}",
+        metrics.cost_estimated,
+        expected
+    );
+}
+
+#[test]
+fn rust_hermes_trajectory_maps_latency_field_to_duration() {
+    let root = temp_root("agenttrace-rust-hermes-trajectory-latency");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let session_path = root.join("one-trajectory.json");
+    fs::write(
+        &session_path,
+        r#"{"conversations":[{"from":"human","value":"ping"},{"from":"gpt","value":"<think>\nok\n</think>\npong"}],"timestamp":"2026-04-01T12:00:10.000Z","model":"claude-sonnet-4","completed":true,"usage":{"input_tokens":11,"output_tokens":7},"duration_seconds":5.0}"#,
+    )
+    .expect("write single trajectory object");
+
+    let parsed = parse_file(&session_path).expect("parse single trajectory object");
+    assert_eq!(parsed.metrics.source_tool, "hermes_trajectory");
+    assert_eq!(parsed.metrics.tokens_input, 11);
+    assert_eq!(parsed.metrics.tokens_output, 7);
+    assert!(
+        (parsed.metrics.duration_sec - 5.0).abs() < 0.05,
+        "expected duration_sec≈5 from duration_seconds, got {}",
+        parsed.metrics.duration_sec
+    );
+    assert!(parsed.metrics.cost_estimated > 0.0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_hermes_trajectory_does_not_claim_hermes_json_session() {
+    let root = temp_root("agenttrace-rust-hermes-trajectory-vs-json");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let session_path = root.join("hermes.json");
+    fs::write(
+        &session_path,
+        r#"{"session_id":"s1","platform":"darwin","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5},"messages":[{"role":"user","content":"hello","timestamp":"2026-01-01T00:00:00Z"},{"role":"assistant","content":"hi","timestamp":"2026-01-01T00:00:01Z"}]}"#,
+    )
+    .expect("write hermes json session");
+
+    let parsed = parse_file(&session_path).expect("parse hermes json session");
+    assert_eq!(parsed.metrics.source_tool, "hermes_json");
+
+    let _ = fs::remove_dir_all(root);
 }

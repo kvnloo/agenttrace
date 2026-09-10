@@ -64,6 +64,8 @@ For local-first tools like Aider, the default history may live in the current re
 
 For SQLite-backed tools like Cursor, prefer a documented JSON export path unless direct database support is worth the dependency and platform cost.
 
+For Hermes Agent ShareGPT trajectory JSONL (`trajectory_samples.jsonl` / batch `trajectories.jsonl`), see [Hermes Trajectory Import](./hermes-trajectory-import.md). That path is distinct from `hermes sessions export` session backups handled by `hermes_json`.
+
 ## Privacy Notes
 
 Do not commit real agent logs unless they are fully synthetic or carefully redacted. Session logs often include prompts, source code, file paths, tool arguments, and secrets.
