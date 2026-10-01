@@ -1,0 +1,86 @@
+version: 1
+repo: kvnloo/agenttrace
+id: agenttrace
+component: agenttrace
+kind: component
+summary: Local-first cross-harness observability surface that parses heterogeneous agent logs into honest session/step evidence, aggregates cost/token/time signals, and renders TUI and governance reports without claiming evidence the source did not record.
+
+architecture:
+  subsystems:
+    - id: parser-normalization
+      name: Cross-harness parser and normalization
+      kind: observability
+      summary: Detects and parses supported harness/session formats into normalized local evidence while preserving source coverage and parse limitations.
+      paths:
+        - crates/agenttrace-core/src/
+        - crates/agenttrace-core/tests/
+        - testdata/
+
+    - id: session-analysis
+      name: Session analysis
+      kind: measurement
+      summary: Computes session health, tokens, estimated cost, time, tool failures, long gaps, context pressure, and conservative capability/detail levels.
+      paths:
+        - crates/agenttrace-core/src/
+      depends_on: [parser-normalization]
+
+    - id: governance-reports
+      name: Governance and diagnostic reports
+      kind: evidence
+      summary: Produces cost audits, recommendations, MCP observations, context trends, delivery evidence, and confidence/coverage metadata without upgrading heuristics into facts.
+      paths:
+        - crates/agenttrace-cli/src/
+        - docs/guides/governance-reports.md
+      depends_on: [session-analysis]
+
+    - id: tui
+      name: Local TUI
+      kind: presentation
+      summary: Presents cross-project sessions, detail, diagnostics, cost, health, failures, and anomalies for local interactive inspection.
+      paths:
+        - crates/agenttrace-tui/
+      depends_on: [session-analysis]
+
+    - id: cli-reporting
+      name: CLI and export surface
+      kind: presentation
+      summary: Exposes JSON, Markdown, HTML, doctor, audit, overview, and related report actions for automation and offline evidence exchange.
+      paths:
+        - crates/agenttrace-cli/
+        - scripts/
+      depends_on: [session-analysis, governance-reports]
+
+  provides_interfaces:
+    - agenttrace.span.v0
+
+  consumes_interfaces:
+    - tokenomics.event.v0
+
+  produces_representations: []
+  consumes_representations: []
+
+  boundaries:
+    owns:
+      - local cross-harness trace parsing
+      - observability normalization
+      - session diagnostics and historical reporting
+      - evidence coverage and confidence metadata
+      - local TUI and report exports
+    not_here:
+      - live harness execution
+      - Tokenomics measurement authority
+      - provider billing truth
+      - proof that a Git commit reached production
+      - canonical Zer0 architecture authority
+
+  evidence:
+    docs:
+      - README.md
+      - docs/README.md
+      - docs/guides/governance-reports.md
+      - docs/guides/parser-guide.md
+    tests:
+      - crates/agenttrace-core/tests/
+      - crates/agenttrace-cli/tests/
+      - testdata/
+    schemas: []
